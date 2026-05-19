@@ -22,7 +22,14 @@ class BertModelWarper(nn.Module):
 
         self.get_extended_attention_mask = bert_model.get_extended_attention_mask
         self.invert_attention_mask = bert_model.invert_attention_mask
-        self.get_head_mask = bert_model.get_head_mask
+        # transformers >= 4.50 dropped BertModel.get_head_mask. Fall back to a
+        # null head mask (per-layer None) — equivalent to the original behavior
+        # when head_mask is None at the BertModel.forward call site.
+        if hasattr(bert_model, "get_head_mask"):
+            self.get_head_mask = bert_model.get_head_mask
+        else:
+            num_layers = bert_model.config.num_hidden_layers
+            self.get_head_mask = lambda head_mask, n_layers=num_layers, _is_attention_chunked=False: [None] * n_layers
 
     def forward(
         self,
@@ -108,8 +115,11 @@ class BertModelWarper(nn.Module):
 
         # We can provide a self-attention mask of dimensions [batch_size, from_seq_length, to_seq_length]
         # ourselves in which case we just need to make it broadcastable to all heads.
+        # transformers >= 4.50 changed the signature: the 3rd positional arg is
+        # now `dtype` (not `device`). Drop the device arg — transformers infers
+        # it from the input tensor.
         extended_attention_mask: torch.Tensor = self.get_extended_attention_mask(
-            attention_mask, input_shape, device
+            attention_mask, input_shape
         )
 
         # If a 2D or 3D attention mask is provided for the cross-attention

@@ -15,8 +15,18 @@ class GroupOp(torch.autograd.Function):
     def forward(cls, ctx, group_id, *inputs):
         ctx.group_id = group_id
         ctx.save_for_backward(*inputs)
-        out = cls.forward_op(ctx.group_id, *inputs)
-        return out
+        # CPU fallback: the lietorch CUDA kernels (Inv/Exp/Log/Mul/Adj/Act/...)
+        # access-violate on sm_120 (RTX 5090) even after rebuilding for that
+        # arch. The CPU kernels (compiled from lietorch_cpu.cpp) work fine;
+        # route through them and copy the result back to the original device.
+        # SE3/SO3/etc tensors are small (~B*7 elements) so the GPU<->CPU
+        # roundtrip is sub-millisecond.
+        device = inputs[0].device
+        if device.type == "cuda":
+            cpu_inputs = tuple(x.detach().cpu().contiguous() for x in inputs)
+            out_cpu = cls.forward_op(ctx.group_id, *cpu_inputs)
+            return out_cpu.to(device)
+        return cls.forward_op(ctx.group_id, *inputs)
 
     @classmethod
     def backward(cls, ctx, grad):
@@ -25,7 +35,15 @@ class GroupOp(torch.autograd.Function):
 
         inputs = ctx.saved_tensors
         grad = grad.contiguous()
-        grad_inputs = cls.backward_op(ctx.group_id, grad, *inputs)
+        # Same CPU fallback for the backward kernel.
+        device = grad.device
+        if device.type == "cuda":
+            cpu_grad = grad.detach().cpu()
+            cpu_inputs = tuple(x.detach().cpu().contiguous() for x in inputs)
+            grad_inputs = cls.backward_op(ctx.group_id, cpu_grad, *cpu_inputs)
+            grad_inputs = tuple(g.to(device) for g in grad_inputs)
+        else:
+            grad_inputs = cls.backward_op(ctx.group_id, grad, *inputs)
         return (None,) + tuple(grad_inputs)
 
 

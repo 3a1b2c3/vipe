@@ -29,7 +29,7 @@ __global__ void exp_forward_kernel(const scalar_t* a_ptr, scalar_t* X_ptr, int n
 
     GPU_1D_KERNEL_LOOP(i, num_threads) {
         Tangent a(a_ptr + i * Group::K);
-        Eigen::Map<Data>(X_ptr + i * Group::N) = Group::Exp(a).data();
+        Eigen::Map<Data, Eigen::Unaligned>(X_ptr + i * Group::N) = Group::Exp(a).data();
     }
 }
 
@@ -43,7 +43,7 @@ __global__ void exp_backward_kernel(const scalar_t* grad, const scalar_t* a_ptr,
     GPU_1D_KERNEL_LOOP(i, num_threads) {
         Tangent a(a_ptr + i * Group::K);
         Grad dX(grad + i * Group::N);
-        Eigen::Map<Grad>(da + i * Group::K) = dX * Group::left_jacobian(a);
+        Eigen::Map<Grad, Eigen::Unaligned>(da + i * Group::K) = dX * Group::left_jacobian(a);
     }
 }
 
@@ -55,7 +55,7 @@ __global__ void log_forward_kernel(const scalar_t* X_ptr, scalar_t* a_ptr, int n
 
     GPU_1D_KERNEL_LOOP(i, num_threads) {
         Tangent a = Group(X_ptr + i * Group::N).Log();
-        Eigen::Map<Tangent>(a_ptr + i * Group::K) = a;
+        Eigen::Map<Tangent, Eigen::Unaligned>(a_ptr + i * Group::K) = a;
     }
 }
 
@@ -69,7 +69,7 @@ __global__ void log_backward_kernel(const scalar_t* grad, const scalar_t* X_ptr,
     GPU_1D_KERNEL_LOOP(i, num_threads) {
         Tangent a = Group(X_ptr + i * Group::N).Log();
         Grad da(grad + i * Group::K);
-        Eigen::Map<Grad>(dX + i * Group::N) = da * Group::left_jacobian_inverse(a);
+        Eigen::Map<Grad, Eigen::Unaligned>(dX + i * Group::N) = da * Group::left_jacobian_inverse(a);
     }
 }
 
@@ -81,7 +81,7 @@ __global__ void inv_forward_kernel(const scalar_t* X_ptr, scalar_t* Y_ptr, int n
 
     GPU_1D_KERNEL_LOOP(i, num_threads) {
         Group X(X_ptr + i * Group::N);
-        Eigen::Map<Data>(Y_ptr + i * Group::N) = X.inv().data();
+        Eigen::Map<Data, Eigen::Unaligned>(Y_ptr + i * Group::N) = X.inv().data();
     }
 }
 
@@ -95,7 +95,7 @@ __global__ void inv_backward_kernel(const scalar_t* grad, const scalar_t* X_ptr,
     GPU_1D_KERNEL_LOOP(i, num_threads) {
         Group Y = Group(X_ptr + i * Group::N).inv();
         Grad dY(grad + i * Group::N);
-        Eigen::Map<Grad>(dX + i * Group::N) = -dY * Y.Adj();
+        Eigen::Map<Grad, Eigen::Unaligned>(dX + i * Group::N) = -dY * Y.Adj();
     }
 }
 
@@ -107,7 +107,7 @@ __global__ void mul_forward_kernel(const scalar_t* X_ptr, const scalar_t* Y_ptr,
 
     GPU_1D_KERNEL_LOOP(i, num_threads) {
         Group Z = Group(X_ptr + i * Group::N) * Group(Y_ptr + i * Group::N);
-        Eigen::Map<Data>(Z_ptr + i * Group::N) = Z.data();
+        Eigen::Map<Data, Eigen::Unaligned>(Z_ptr + i * Group::N) = Z.data();
     }
 }
 
@@ -122,8 +122,8 @@ __global__ void mul_backward_kernel(const scalar_t* grad, const scalar_t* X_ptr,
     GPU_1D_KERNEL_LOOP(i, num_threads) {
         Grad dZ(grad + i * Group::N);
         Group X(X_ptr + i * Group::N);
-        Eigen::Map<Grad>(dX + i * Group::N) = dZ;
-        Eigen::Map<Grad>(dY + i * Group::N) = dZ * X.Adj();
+        Eigen::Map<Grad, Eigen::Unaligned>(dX + i * Group::N) = dZ;
+        Eigen::Map<Grad, Eigen::Unaligned>(dY + i * Group::N) = dZ * X.Adj();
     }
 }
 
@@ -136,7 +136,7 @@ __global__ void adj_forward_kernel(const scalar_t* X_ptr, const scalar_t* a_ptr,
     GPU_1D_KERNEL_LOOP(i, num_threads) {
         Group X(X_ptr + i * Group::N);
         Tangent a(a_ptr + i * Group::K);
-        Eigen::Map<Tangent>(b_ptr + i * Group::K) = X.Adj(a);
+        Eigen::Map<Tangent, Eigen::Unaligned>(b_ptr + i * Group::K) = X.Adj(a);
     }
 }
 
@@ -155,8 +155,8 @@ __global__ void adj_backward_kernel(const scalar_t* grad, const scalar_t* X_ptr,
         Tangent a(a_ptr + i * Group::K);
         Tangent b = X.Adj() * a;
 
-        Eigen::Map<Grad>(da + i * Group::K) = db * X.Adj();
-        Eigen::Map<Grad>(dX + i * Group::N) = -db * Group::adj(b);
+        Eigen::Map<Grad, Eigen::Unaligned>(da + i * Group::K) = db * X.Adj();
+        Eigen::Map<Grad, Eigen::Unaligned>(dX + i * Group::N) = -db * Group::adj(b);
     }
 }
 
@@ -169,7 +169,7 @@ __global__ void adjT_forward_kernel(const scalar_t* X_ptr, const scalar_t* a_ptr
     GPU_1D_KERNEL_LOOP(i, num_threads) {
         Group X(X_ptr + i * Group::N);
         Tangent a(a_ptr + i * Group::K);
-        Eigen::Map<Tangent>(b_ptr + i * Group::K) = X.AdjT(a);
+        Eigen::Map<Tangent, Eigen::Unaligned>(b_ptr + i * Group::K) = X.AdjT(a);
     }
 }
 
@@ -186,8 +186,8 @@ __global__ void adjT_backward_kernel(const scalar_t* grad, const scalar_t* X_ptr
         Tangent db(grad + i * Group::K);
         Grad a(a_ptr + i * Group::K);
 
-        Eigen::Map<Tangent>(da + i * Group::K) = X.Adj(db);
-        Eigen::Map<Grad>(dX + i * Group::N) = -a * Group::adj(X.Adj(db));
+        Eigen::Map<Tangent, Eigen::Unaligned>(da + i * Group::K) = X.Adj(db);
+        Eigen::Map<Grad, Eigen::Unaligned>(dX + i * Group::N) = -a * Group::adj(X.Adj(db));
     }
 }
 
@@ -201,7 +201,7 @@ __global__ void act_forward_kernel(const scalar_t* X_ptr, const scalar_t* p_ptr,
     GPU_1D_KERNEL_LOOP(i, num_threads) {
         Group X(X_ptr + i * Group::N);
         Point p(p_ptr + i * 3);
-        Eigen::Map<Point>(q_ptr + i * 3) = X * p;
+        Eigen::Map<Point, Eigen::Unaligned>(q_ptr + i * 3) = X * p;
     }
 }
 
@@ -220,8 +220,8 @@ __global__ void act_backward_kernel(const scalar_t* grad, const scalar_t* X_ptr,
         Point p(p_ptr + i * 3);
         PointGrad dq(grad + i * 3);
 
-        Eigen::Map<PointGrad>(dp + i * 3) = dq * X.Matrix4x4().block<3, 3>(0, 0);
-        Eigen::Map<Grad>(dX + i * Group::N) = dq * Group::act_jacobian(X * p);
+        Eigen::Map<PointGrad, Eigen::Unaligned>(dp + i * 3) = dq * X.Matrix4x4().block<3, 3>(0, 0);
+        Eigen::Map<Grad, Eigen::Unaligned>(dX + i * Group::N) = dq * Group::act_jacobian(X * p);
     }
 }
 
@@ -235,7 +235,7 @@ __global__ void act4_forward_kernel(const scalar_t* X_ptr, const scalar_t* p_ptr
     GPU_1D_KERNEL_LOOP(i, num_threads) {
         Group X(X_ptr + i * Group::N);
         Point p(p_ptr + i * 4);
-        Eigen::Map<Point>(q_ptr + i * 4) = X.act4(p);
+        Eigen::Map<Point, Eigen::Unaligned>(q_ptr + i * 4) = X.act4(p);
     }
 }
 
@@ -254,9 +254,9 @@ __global__ void act4_backward_kernel(const scalar_t* grad, const scalar_t* X_ptr
         Point p(p_ptr + i * 4);
         PointGrad dq(grad + i * 4);
 
-        Eigen::Map<PointGrad>(dp + i * 4) = dq * X.Matrix4x4();
+        Eigen::Map<PointGrad, Eigen::Unaligned>(dp + i * 4) = dq * X.Matrix4x4();
         const Point q = X.act4(p);
-        Eigen::Map<Grad>(dX + i * Group::N) = dq * Group::act4_jacobian(q);
+        Eigen::Map<Grad, Eigen::Unaligned>(dX + i * Group::N) = dq * Group::act4_jacobian(q);
     }
 }
 
@@ -269,7 +269,7 @@ __global__ void as_matrix_forward_kernel(const scalar_t* X_ptr, scalar_t* T_ptr,
 
     GPU_1D_KERNEL_LOOP(i, num_threads) {
         Group X(X_ptr + i * Group::N);
-        Eigen::Map<Matrix4>(T_ptr + i * 16) = X.Matrix4x4();
+        Eigen::Map<Matrix4, Eigen::Unaligned>(T_ptr + i * 16) = X.Matrix4x4();
     }
 }
 
@@ -280,7 +280,7 @@ __global__ void orthogonal_projector_kernel(const scalar_t* X_ptr, scalar_t* P_p
 
     GPU_1D_KERNEL_LOOP(i, num_threads) {
         Group X(X_ptr + i * Group::N);
-        Eigen::Map<Proj>(P_ptr + i * Group::N * Group::N) = X.orthogonal_projector();
+        Eigen::Map<Proj, Eigen::Unaligned>(P_ptr + i * Group::N * Group::N) = X.orthogonal_projector();
     }
 }
 
@@ -294,7 +294,7 @@ __global__ void jleft_forward_kernel(const scalar_t* X_ptr, const scalar_t* a_pt
         Group X(X_ptr + i * Group::N);
         Tangent a(a_ptr + i * Group::K);
         Tangent b = Group::left_jacobian_inverse(X.Log()) * a;
-        Eigen::Map<Tangent>(b_ptr + i * Group::K) = b;
+        Eigen::Map<Tangent, Eigen::Unaligned>(b_ptr + i * Group::K) = b;
     }
 }
 

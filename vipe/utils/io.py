@@ -14,6 +14,7 @@
 # limitations under the License.
 
 import logging
+import os
 import tempfile
 import zipfile
 
@@ -272,11 +273,21 @@ def save_depth_artifacts(out_path: ArtifactPath, cached_final_stream: VideoStrea
                 height, width = metric_depth.shape
                 header = OpenEXR.Header(width, height)
                 header["channels"] = {"Z": Imath.Channel(Imath.PixelType(Imath.PixelType.HALF))}
-                with tempfile.NamedTemporaryFile(suffix=".exr") as f:
+                # Windows: NamedTemporaryFile holds an exclusive lock so OpenEXR
+                # can't reopen by name -> "Permission denied". Use delete=False +
+                # close the handle ourselves before OpenEXR writes, then unlink.
+                f = tempfile.NamedTemporaryFile(suffix=".exr", delete=False)
+                f.close()
+                try:
                     exr = OpenEXR.OutputFile(f.name, header)
                     exr.writePixels({"Z": metric_depth.astype(np.float16).tobytes()})
                     exr.close()
                     z.write(f.name, f"{frame_idx:05d}.exr")
+                finally:
+                    try:
+                        os.unlink(f.name)
+                    except OSError:
+                        pass
 
 
 def read_depth_artifacts(zip_file_path: Path) -> Iterator[tuple[int, torch.Tensor]]:

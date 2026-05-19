@@ -63,10 +63,15 @@ if os.environ.get("USE_SYSTEM_EIGEN", "0") == "0":
 
             shutil.move(os.path.join(extracted_dir, "eigen-3.4.0", "Eigen"), eigen_include_dir)
 
-    # Use full path
+    # Use full path. We previously used "-isystem <path>" which works for GCC/clang
+    # but MSVC cl.exe drops it ("ignoring unknown option '-isystem'") and then
+    # treats the path as a stray source file, leaving the Eigen include unresolved.
+    # Use include_dirs on the extension instead — distutils translates that into
+    # the right per-compiler flag (/I on MSVC, -I on GCC/clang).
     additional_include_path = os.path.join(os.path.dirname(__file__), "csrc/include")
-    cpp_flags += ["-isystem", additional_include_path]
-    cuda_flags += ["-isystem", additional_include_path]
+    include_dirs = [additional_include_path]
+else:
+    include_dirs = []
 
 packages = find_packages()
 setup(
@@ -76,6 +81,7 @@ setup(
         CUDAExtension(
             f"{PACKAGE_NAME}_ext",
             sources=get_sources(),  # type: ignore
+            include_dirs=include_dirs,
             extra_compile_args={"cxx": cpp_flags, "nvcc": cuda_flags},  # type: ignore
         )
     ],

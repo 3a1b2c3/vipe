@@ -32,8 +32,16 @@ def _additional_include_flags() -> list[str]:
 
 
 def get_cpp_flags() -> list[str]:
-    return ["-O3", "-DWITH_CUDA"] + _additional_include_flags()
+    # -DUSE_CUDA: torch>=2.10's compiled_autograd.h has a Windows guard at line 1111
+    # `#if defined(_WIN32) && (defined(USE_CUDA) || defined(USE_ROCM))` that skips an
+    # if-constexpr block which triggers C2872 'std: ambiguous symbol' when included
+    # together with Eigen on MSVC (Eigen extends namespace std). Without USE_CUDA the
+    # broken block is compiled and breaks the build.
+    return ["-O3", "-DWITH_CUDA", "-DUSE_CUDA"] + _additional_include_flags()
 
 
 def get_cuda_flags() -> list[str]:
-    return ["-O3", "-DWITH_CUDA", "--use_fast_math"] + _additional_include_flags()
+    # --use_fast_math removed: relaxed-math intrinsics on sm_120 (RTX 5090) cause
+    # access-violation crashes inside lietorch_gpu.cu SE3.inv() kernel. Suspected
+    # FMA / division path producing NaN -> Eigen Map misalignment crash.
+    return ["-O3", "-DWITH_CUDA", "-DUSE_CUDA"] + _additional_include_flags()
