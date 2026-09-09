@@ -30,11 +30,21 @@ dependencies = [
     "python-pycg",
     "timm",
     "transformers",
-    "gdown",
+    # Capped below 6: gdown 6 dropped the `fuzzy` parameter (fuzzy URL parsing
+    # became the default), but priors/track_anything/__init__.py still passes
+    # fuzzy=True when fetching the AOT checkpoint. With gdown 6 installed that
+    # raises TypeError at pipeline construction, which the MIND scoring path
+    # swallows per-sample as "[skip action] ViPE extract_traj crashed" -- so the
+    # run completes and silently produces no action metric at all.
+    "gdown<6",
     "OpenEXR",
     "kornia",
     "viser",
     "click",
+    # cli/main.py imports hydra, but it was never declared. The package installs
+    # fine and `import vipe` works; only the `vipe` console script fails, and
+    # only when first executed -- which for MIND is inside the scoring pool.
+    "hydra-core",
 ]
 
 [project.optional-dependencies]
