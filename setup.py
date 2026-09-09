@@ -45,8 +45,27 @@ if "CONDA_PREFIX" in os.environ:
         os.environ["PYTORCH_NVCC"] = conda_nvcc_path
 
 # Download the put Eigen 3.4 in a correct place
-cpp_flags = get_cpp_flags()
-cuda_flags = get_cuda_flags()
+cpp_flags = list(get_cpp_flags())
+cuda_flags = list(get_cuda_flags())
+
+# Pin C++17. No standard is set otherwise, so nvcc follows the host compiler's
+# default -- C++20 on GCC 13 -- which makes std::lerp visible. csrc/utils_ext/
+# math_util.h:1059 then declares its own `float lerp(float, float, float)`,
+# which the compiler reads as a redeclaration of std::lerp with a different
+# return-type qualification and rejects:
+#
+#   math_util.h:1059:44: error: 'float lerp(float, float, float)' conflicts
+#   with a previous declaration
+#   /usr/include/c++/13/cmath:3642: note: previous declaration
+#   'constexpr float std::lerp(float, float, float)'
+#
+# Only the scalar overload collides; the float2/float4 ones take ViPE's own
+# types and are unaffected. Setting the standard rather than editing the header
+# keeps the fix outside the sources, so it survives a submodule update.
+if not any(flag.startswith("-std=") for flag in cpp_flags):
+    cpp_flags.append("-std=c++17")
+if not any(flag.startswith("-std=") for flag in cuda_flags):
+    cuda_flags.append("-std=c++17")
 if os.environ.get("USE_SYSTEM_EIGEN", "0") == "0":
     eigen_include_dir = "csrc/include/eigen3"
     eigen_url = "https://gitlab.com/libeigen/eigen/-/archive/3.4.0/eigen-3.4.0.tar.gz"
