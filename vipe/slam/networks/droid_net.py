@@ -27,6 +27,7 @@ import torch.nn.functional as F
 
 from vipe.ext import droid_net_ext
 from vipe.ext.scatter import scatter_mean
+from vipe.utils.model_cache import ModelCache
 
 
 class CorrSampler(torch.autograd.Function):
@@ -141,7 +142,7 @@ class AltCorrBlock:
             self.pyramid.append(fmap_lvl.view(*sz))
             fmaps = F.avg_pool2d(fmaps, 2, stride=2)
 
-    def corr_fn(self, coords, ii, jj):
+    def corr_fn_reference(self, coords, ii, jj):
         B, N, H, W, S, _ = coords.shape
         coords = coords.permute(0, 1, 4, 2, 3, 5)
 
@@ -161,6 +162,26 @@ class AltCorrBlock:
 
         corr = torch.cat(corr_list, dim=2)
         return corr
+
+    def corr_fn_indexed(self, coords, ii, jj):
+        if coords.shape[-2] != 1:
+            return self.corr_fn_reference(coords, ii, jj)
+
+        coords = coords.squeeze(dim=-2).contiguous()
+        ii = ii.contiguous()
+        jj = jj.contiguous()
+        (corr,) = droid_net_ext.altcorr_index_forward(
+            self.pyramid[0],
+            self.pyramid,
+            coords,
+            ii,
+            jj,
+            self.radius,
+        )
+        return corr.unsqueeze(dim=-1)
+
+    def corr_fn(self, coords, ii, jj):
+        return self.corr_fn_indexed(coords, ii, jj)
 
     def __call__(self, coords, ii, jj):
         squeeze_output = False
@@ -500,29 +521,38 @@ class UpdateModule(nn.Module):
 
 
 class DroidNet(nn.Module):
+    image_mean: torch.Tensor
+    image_std: torch.Tensor
+
     def __init__(self):
         super(DroidNet, self).__init__()
         self.fnet = BasicEncoder(output_dim=128, norm_fn="instance")
         self.cnet = BasicEncoder(output_dim=256, norm_fn="none")
         self.update = UpdateModule()
+        self.register_buffer(
+            "image_mean",
+            torch.tensor([0.485, 0.456, 0.406], dtype=torch.float32).view(1, 1, 3, 1, 1),
+            persistent=False,
+        )
+        self.register_buffer(
+            "image_std",
+            torch.tensor([0.229, 0.224, 0.225], dtype=torch.float32).view(1, 1, 3, 1, 1),
+            persistent=False,
+        )
         self.load_weights()
 
     @torch.amp.autocast("cuda", enabled=True)
     def encode_features(self, images: torch.Tensor):
         """image (torch.Tensor): BCHW image RGB 0-1"""
-        mean = torch.as_tensor([0.485, 0.456, 0.406], device=images.device)
-        std = torch.as_tensor([0.229, 0.224, 0.225], device=images.device)
         # (1, B, C, H, W) - (x, x, 3, 1, 1)
-        images = (images[None] - mean[:, None, None]) / std[:, None, None]
+        images = (images[None] - self.image_mean) / self.image_std
         return self.fnet(images).squeeze(0)
 
     @torch.amp.autocast("cuda", enabled=True)
     def encode_context(self, images: torch.Tensor):
         """image (torch.Tensor): BCHW image RGB 0-1"""
-        mean = torch.as_tensor([0.485, 0.456, 0.406], device=images.device)
-        std = torch.as_tensor([0.229, 0.224, 0.225], device=images.device)
         # (1, B, C, H, W) - (x, x, 3, 1, 1)
-        images = (images[None] - mean[:, None, None]) / std[:, None, None]
+        images = (images[None] - self.image_mean) / self.image_std
         net, inp = self.cnet(images).split([128, 128], dim=2)
         return net.tanh().squeeze(0), inp.relu().squeeze(0)
 
@@ -535,9 +565,8 @@ class DroidNet(nn.Module):
         if not ckpt_path.exists():
             ckpt_path.parent.mkdir(parents=True, exist_ok=True)
             gdown.download(
-                "https://drive.google.com/file/d/1PpqVt1H4maBa_GbPJp4NwxRsd9jk-elh/view",
+                id="1PpqVt1H4maBa_GbPJp4NwxRsd9jk-elh",
                 output=str(ckpt_path),
-                fuzzy=True,
             )
 
         state_dict = OrderedDict(
@@ -551,3 +580,21 @@ class DroidNet(nn.Module):
 
         self.load_state_dict(state_dict)
         self.eval()
+
+
+def get_droid_net(device: torch.device, model_cache: ModelCache | None = None) -> DroidNet:
+    """Build DroidNet, optionally reusing the caller-owned model cache."""
+    device = torch.device(device)
+    if device.type == "cuda" and device.index is None and torch.cuda.is_available():
+        device = torch.device("cuda", torch.cuda.current_device())
+
+    if model_cache is None:
+        return DroidNet().to(device)
+
+    def build_cached_droid_net() -> DroidNet:
+        net = DroidNet().to(device)
+        net.eval()
+        net.requires_grad_(False)
+        return net
+
+    return model_cache.get(f"slam/droid_net/{device}", build_cached_droid_net)

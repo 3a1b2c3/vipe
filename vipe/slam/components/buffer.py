@@ -23,7 +23,6 @@ import logging
 import numpy as np
 import rerun as rr
 import torch
-
 from einops import rearrange
 from omegaconf.dictconfig import DictConfig
 
@@ -33,15 +32,16 @@ from vipe.priors.depth import DepthEstimationInput, DepthEstimationModel
 from vipe.priors.depth.base import DepthType
 from vipe.utils.cameras import CameraType
 from vipe.utils.logging import pbar
+from vipe.utils.misc import unpack_optional
 from vipe.utils.visualization import POINTS_STENCIL, draw_lines_batch, draw_points_batch
 
+from ..ba.kernel import build_robust_kernel
 from ..ba.solver import Solver, SparseBlockVector
 from ..ba.terms import DenseDepthFlowTerm, DispSensRegularizationTerm
 from ..interface import SLAMMap
 from ..maths import geom
 from ..maths.retractor import DenseDispRetractor, IntrinsicsRetractor, PoseRetractor, RigRotationOnlyRetractor
 from .sparse_tracks import SparseTracks
-
 
 logger = logging.getLogger(__name__)
 
@@ -230,6 +230,40 @@ class GraphBuffer:
         self.cross_view_idx[ix] = self.cross_view_idx[ix + 1]
         self.n_frames -= 1
 
+    def retire_head(self, count: int):
+        """Remove the oldest ``count`` keyframes, compacting the buffer to the left.
+
+        Used by the long-sequence SLAM recipe (``vipe.slam.longseq``): all
+        per-slot state of slots ``[count, n_frames)`` moves to ``[0, n_frames -
+        count)`` so that the invariant *slot order == temporal order* is
+        preserved. The caller owns the retired keyframes' state (poses, depth,
+        map points must be read out *before* this call) and must re-index any
+        factor graph over this buffer (``FactorGraph.shift_indices``).
+        """
+        assert 0 < count < self.n_frames, "retirement must keep at least one live keyframe"
+        n = self.n_frames
+        per_slot_tensors = [
+            self.tstamp,
+            self.images,
+            self.poses,
+            self.disps,
+            self.disps_sens,
+            self.masks,
+            self.fmaps,
+            self.nets,
+            self.inps,
+            self.dirty,
+            self.cross_view_idx,
+        ]
+        for tensor in per_slot_tensors:
+            # .clone() the source: in-place assignment between overlapping
+            # slices of the same tensor is not otherwise guaranteed on CUDA.
+            tensor[: n - count] = tensor[count:n].clone()
+        # cross_view_idx[..., 0] stores absolute slot indices of cross-view
+        # targets; they moved left together with everything else.
+        self.cross_view_idx[: n - count, :, 0] -= count
+        self.n_frames = n - count
+
     def update_disps_sens(self, depth_model: DepthEstimationModel | None, frame_idx: int | None):
         if depth_model is None:
             return
@@ -253,19 +287,20 @@ class GraphBuffer:
             frames_to_update = pbar(range(self.n_frames), desc="Update depth")
 
         assert self.n_views == 1
+        intrinsics = unpack_optional(self.intrinsics)
 
         for frame_idx in frames_to_update:
             depth_input = DepthEstimationInput(
                 rgb=self.images[frame_idx].moveaxis(1, -1).float(),
-                intrinsics=self.intrinsics[0],
+                intrinsics=intrinsics[0],
                 camera_type=self.camera_type,
             )
-            disp_sens = depth_model.estimate(depth_input).metric_depth
+            disp_sens = unpack_optional(depth_model.estimate(depth_input).metric_depth)
             disp_sens = disp_sens[:, 3::8, 3::8]
             disp_sens = torch.where(disp_sens > 0, disp_sens.reciprocal(), disp_sens)
             self.disps_sens[frame_idx] = disp_sens
 
-        self.last_depth_intrinsics = self.intrinsics.clone()
+        self.last_depth_intrinsics = intrinsics.clone()
 
     def build_adaptive_cross_view_idx(self, valid_thresh: float = 400.0):
         """
@@ -360,6 +395,116 @@ class GraphBuffer:
             dj.reshape(-1),
         )
 
+    def _fused_ba(
+        self,
+        target: torch.Tensor,
+        weight: torch.Tensor,
+        disp_damping: torch.Tensor,
+        ii: torch.Tensor,
+        jj: torch.Tensor,
+        t0: int,
+        t1: int,
+        n_iters: int,
+        pose_damping: float,
+        pose_ep: float,
+        motion_only: bool,
+        limited_disp: bool,
+        optimize_intrinsics: bool,
+        optimize_rig_rotation: bool,
+        weight_dense_disp: float,
+        verbose: bool,
+    ) -> None:
+        def fail(reason: str) -> None:
+            raise RuntimeError(f"Fused BA is enabled, but {reason}. Set ba.fused=false to use the generic BA solver.")
+
+        if self.n_views != 1 or self.camera_type != CameraType.PINHOLE:
+            fail("it only supports single-view pinhole-camera graph buffers")
+        if optimize_rig_rotation:
+            fail("it does not support optimizing rig rotation")
+        if self.sparse_tracks.enabled:
+            fail("it does not support sparse-track factors")
+        if t0 >= t1:
+            fail("the active optimization range is empty")
+        if target.shape[0] != ii.shape[0] or weight.shape[0] != ii.shape[0]:
+            fail("target/weight edge counts do not match the graph edges")
+
+        edge_mask = ii != jj
+        if not torch.any(edge_mask):
+            fail("the graph contains no non-self edges")
+        if not torch.all(edge_mask):
+            ii = ii[edge_mask]
+            jj = jj[edge_mask]
+            target = target[edge_mask]
+            weight = weight[edge_mask]
+
+        identity_rig = torch.as_tensor([0, 0, 0, 0, 0, 0, 1], dtype=self.rig.dtype, device=self.rig.device)
+        if not torch.allclose(self.rig[0], identity_rig):
+            fail("it only supports identity rig extrinsics")
+
+        ht, wd = self.height // 8, self.width // 8
+
+        target = rearrange(target, "k (h w) c -> k c h w", h=ht, w=wd, c=2).contiguous()
+        weight = rearrange(weight, "k (h w) c -> k c h w", h=ht, w=wd, c=2).contiguous()
+
+        kx = torch.unique(torch.cat([torch.arange(t0, t1, device=self.device), ii]))
+        eta = (0.2 * disp_damping[kx] + 1e-7).contiguous()
+        intrinsics_scale = 1.0 / 8.0
+        intrinsics = (
+            self.camera_type.build_camera_model(self.intrinsics)
+            .pinhole()
+            .scaled(intrinsics_scale)
+            .intrinsics[0]
+            .contiguous()
+        )
+        depth_active = torch.ones(self.disps.shape[0], dtype=self.disps.dtype, device=self.device)
+        if limited_disp:
+            depth_active.zero_()
+            depth_active[t0:t1] = 1.0
+
+        intrinsics_damping_scale = self.ba_config.get("intrinsics_damping_scale", 1.0)
+
+        # BAConfig.solver selects which fused kernel implementation to use; the
+        # default ("legacy") always calls slam_ext.ba_extended, exactly as before
+        # this option was introduced. "fused_v2" is opt-in only.
+        fused_ba_fn = slam_ext.ba_extended_v2 if self.ba_config.get("solver", "legacy") == "fused_v2" else slam_ext.ba_extended
+        try:
+            _, _, ba_energy = fused_ba_fn(
+                self.poses,
+                self.disps[:, 0],
+                intrinsics,
+                self.disps_sens[:, 0],
+                target,
+                weight,
+                eta,
+                ii.contiguous(),
+                jj.contiguous(),
+                depth_active.contiguous(),
+                t0,
+                t1,
+                n_iters,
+                pose_damping,
+                pose_ep,
+                motion_only,
+                float(self.ba_config.dense_disp_alpha),
+                bool(optimize_intrinsics),
+                1e-6 * intrinsics_damping_scale,
+                1e-6 * intrinsics_damping_scale,
+                intrinsics_scale,
+                verbose,
+                weight_dense_disp,
+            )
+        except (AttributeError, TypeError) as exc:
+            raise RuntimeError(
+                "Fused BA is enabled, but the loaded vipe_ext runtime does not match the fused BA API. "
+                "Rebuild the extension or run with VIPE_EXT_JIT=1."
+            ) from exc
+
+        if verbose:
+            logger.info(f"BA iters = {n_iters}, energy: {ba_energy[0].item()} -> {ba_energy[-1].item()}")
+
+        if optimize_intrinsics:
+            self.intrinsics[0, :4] = intrinsics / intrinsics_scale
+
     def expand_tracks_edges(self, ii: torch.Tensor, tracks_length: int):
         iis = [ii] * (tracks_length - 1)
         jjs = [ii - m - 1 for m in range(tracks_length - 1)]
@@ -401,6 +546,42 @@ class GraphBuffer:
         di_unique = torch.unique(di)
         pi_unique = torch.unique(ii)  # Should be equivalent to unique(pi)
 
+        robust_kernel = build_robust_kernel(
+            name=self.ba_config.get("robust_kernel", None),
+            threshold=float(self.ba_config.get("robust_kernel_threshold", 1.0)),
+            gnc_mu_init=float(self.ba_config.get("gnc_mu_init", 1.0)),
+            gnc_mu_step=float(self.ba_config.get("gnc_mu_step", 1.4)),
+            gnc_mu_max=float(self.ba_config.get("gnc_mu_max", 1.0e6)),
+        )
+
+        if self.ba_config.fused:
+            if robust_kernel is not None:
+                raise RuntimeError(
+                    "Fused BA is enabled, but robust kernels are not supported. "
+                    "Set ba.fused=false to use the generic BA solver."
+                )
+
+            self._fused_ba(
+                target,
+                weight,
+                disp_damping,
+                ii,
+                jj,
+                t0,
+                t1,
+                n_iters,
+                pose_damping,
+                pose_ep,
+                motion_only,
+                limited_disp,
+                optimize_intrinsics,
+                optimize_rig_rotation,
+                weight_dense_disp,
+                verbose,
+            )
+            self.disps.clamp_(min=0.001)
+            return
+
         solver = Solver(compute_energy=verbose)
         solver.add_term(
             DenseDepthFlowTerm(
@@ -416,7 +597,8 @@ class GraphBuffer:
                 rig=None,
                 image_size=(self.height // 8, self.width // 8),
                 camera_type=self.camera_type,
-            )
+            ),
+            kernel=robust_kernel,
         )
 
         if self.sparse_tracks.enabled:
@@ -445,7 +627,8 @@ class GraphBuffer:
                     rig=None,
                     image_size=(self.height // 8, self.width // 8),
                     camera_type=self.camera_type,
-                )
+                ),
+                kernel=robust_kernel,
             )
 
         # self.debug_visualize_target_weight(
@@ -494,7 +677,8 @@ class GraphBuffer:
         solver.set_marginilized("dense_disp")
 
         solver.set_retractor("intrinsics", IntrinsicsRetractor(self.camera_type))
-        solver.set_damping("intrinsics", damping=1e-6, ep=1e-6)
+        intrinsics_damping_scale = self.ba_config.get("intrinsics_damping_scale", 1.0)
+        solver.set_damping("intrinsics", damping=1e-6 * intrinsics_damping_scale, ep=1e-6 * intrinsics_damping_scale)
         if not optimize_intrinsics:
             solver.set_fixed("intrinsics")
 
@@ -507,17 +691,27 @@ class GraphBuffer:
 
         disps_flattened = rearrange(self.flattened_disps, "nv h w -> nv (h w)")
 
-        ba_energy = []
-        for _ in range(n_iters):
-            cur_energy = solver.run_inplace(
-                {
-                    "pose": SE3(self.poses),
-                    "dense_disp": disps_flattened,
-                    "intrinsics": self.intrinsics,
-                    "rig": SE3(self.rig),
-                }
-            )
-            ba_energy.append(cur_energy)
+        variables = {
+            "pose": SE3(self.poses),
+            "dense_disp": disps_flattened,
+            "intrinsics": self.intrinsics,
+            "rig": SE3(self.rig),
+        }
+
+        ba_energy: list[float] = []
+        if robust_kernel is not None and robust_kernel.is_gnc():
+            # GNC: outer mu schedule, inner GN iters at frozen mu.
+            n_mu_steps = max(1, int(self.ba_config.get("gnc_n_mu_steps", 4)))
+            gn_iters_per_mu = max(1, int(self.ba_config.get("gnc_gn_iters_per_mu", 6)))
+            current_mu = robust_kernel.mu_init if hasattr(robust_kernel, "mu_init") else 1.0
+            for _ in range(n_mu_steps):
+                robust_kernel.set_mu(current_mu)
+                for _ in range(gn_iters_per_mu):
+                    ba_energy.append(solver.run_inplace(variables))
+                current_mu = robust_kernel.update_mu(current_mu)
+        else:
+            for _ in range(n_iters):
+                ba_energy.append(solver.run_inplace(variables))
 
         if verbose:
             logger.info(f"BA iters = {n_iters}, energy: {ba_energy[0]} -> {ba_energy[-1]}")
@@ -652,7 +846,7 @@ class GraphBuffer:
         frame_indices = self.tstamp[: self.n_frames].cpu().numpy()
 
         for kf_idx in range(self.n_frames):
-            rr.set_time_sequence("frame", int(frame_indices[kf_idx]))
+            rr.set_time("frame", sequence=int(frame_indices[kf_idx]))
 
             for v in range(self.n_views):
                 canvas = self.images[kf_idx, v].moveaxis(0, -1).cpu().numpy().astype(np.float32)
@@ -713,7 +907,7 @@ class GraphBuffer:
         current_map = self.extract_slam_map(filter_thresh=vis_thresh, t_range=dirty_index, is_local=False)
 
         for di, didx in enumerate(dirty_index.cpu().numpy().tolist()):
-            rr.set_time_sequence("frame", int(self.tstamp[int(didx)].item()))
+            rr.set_time("frame", sequence=int(self.tstamp[int(didx)].item()))
 
             pose_mat = SE3(self.poses[int(didx)]).inv().matrix().cpu().numpy()
             rr.log(

@@ -23,14 +23,12 @@ import warnings
 import numpy as np
 import rerun as rr
 import torch
-
 from einops import rearrange
 
 from vipe.ext.lietorch import SE3
 
 from ..networks.droid_net import AltCorrBlock, CorrBlock, DroidNet
 from .buffer import GraphBuffer
-
 
 # Disable all future warnings (mainly torch.cuda.amp related)
 warnings.simplefilter(action="ignore", category=FutureWarning)
@@ -96,14 +94,16 @@ class FactorGraph:
     def __filter_repeated_edges(self, ii, jj):
         """remove duplicate edges"""
 
-        keep = torch.zeros(ii.shape[0], dtype=torch.bool, device=ii.device)
         eset = set(
-            [(i.item(), j.item()) for i, j in zip(self.ii, self.jj)]
-            + [(i.item(), j.item()) for i, j in zip(self.ii_inac, self.jj_inac)]
+            [tuple(edge) for edge in torch.stack([self.ii, self.jj], dim=-1).detach().cpu().tolist()]
+            + [tuple(edge) for edge in torch.stack([self.ii_inac, self.jj_inac], dim=-1).detach().cpu().tolist()]
         )
 
-        for k, (i, j) in enumerate(zip(ii, jj)):
-            keep[k] = (i.item(), j.item()) not in eset
+        keep = torch.as_tensor(
+            [tuple(edge) not in eset for edge in torch.stack([ii, jj], dim=-1).detach().cpu().tolist()],
+            dtype=torch.bool,
+            device=ii.device,
+        )
 
         return ii[keep], jj[keep]
 
@@ -226,6 +226,41 @@ class FactorGraph:
         self.ii[self.ii >= ix] -= 1
         self.jj[self.jj >= ix] -= 1
         self.rm_factors(m, store=False)
+
+    def shift_indices(self, count: int):
+        """Re-index all edges after the oldest ``count`` keyframes were retired.
+
+        Used by the long-sequence SLAM recipe (``vipe.slam.longseq``).
+        Companion to ``GraphBuffer.retire_head``: buffer slots moved left by
+        ``count``, so every stored keyframe index must follow. Active edges must
+        not reference retired slots (the caller guarantees retirement only
+        touches keyframes below the frontend window -- asserted here); inactive
+        edges touching retired slots are dropped, as they can never be revived.
+        """
+        if count == 0:
+            return
+        assert not torch.any((self.ii < count) | (self.jj < count)), (
+            "active factor-graph edges reference retired keyframes; "
+            "retirement must stay below the frontend optimization window"
+        )
+        self.ii = self.ii - count
+        self.jj = self.jj - count
+
+        # damping is indexed by buffer slot (one row per flattened disp map) and
+        # is read by the BA for frames whose rows were not rewritten in the same
+        # update (revived inactive edges, in-range frames) -- shift it along.
+        shift = count * self.buffer.n_views
+        self.damping[:-shift] = self.damping[shift:].clone()
+
+        keep = (self.ii_inac >= count) & (self.jj_inac >= count)
+        if not torch.all(keep):
+            exp_keep = keep.view(-1, 1).repeat(1, self.buffer.n_views).view(-1)
+            self.ii_inac = self.ii_inac[keep]
+            self.jj_inac = self.jj_inac[keep]
+            self.target_inac = self.target_inac[:, exp_keep]
+            self.weight_inac = self.weight_inac[:, exp_keep]
+        self.ii_inac = self.ii_inac - count
+        self.jj_inac = self.jj_inac - count
 
     @torch.amp.autocast("cuda", enabled=True)
     def update(
@@ -440,9 +475,15 @@ class FactorGraph:
         d = self.buffer.frame_distance_dense_disp(ii, jj, beta=beta)
         d = d.mean(-1)
 
+        d_np = d.detach().cpu().numpy()
+        ii_np = ii.detach().cpu().numpy()
+        jj_np = jj.detach().cpu().numpy()
+        active_edges = torch.stack([self.ii, self.jj], dim=-1).detach().cpu().numpy()
+        inactive_edges = torch.stack([self.ii_inac, self.jj_inac], dim=-1).detach().cpu().numpy()
+
         def _suppress(i: int, j: int):
             if (t0 <= i < t) and (t1 <= j < t):
-                d[(i - t0) * (t - t1) + (j - t1)] = np.inf
+                d_np[(i - t0) * (t - t1) + (j - t1)] = np.inf
 
         def _suppress_nms(i: int, j: int):
             for di in range(-nms, nms + 1):
@@ -450,13 +491,13 @@ class FactorGraph:
                     if abs(di) + abs(dj) <= max(min(abs(i - j) - 2, nms), 0):
                         _suppress(i + di, j + dj)
 
-        for i, j in zip(self.ii.cpu().numpy(), self.jj.cpu().numpy()):
+        for i, j in active_edges:
             _suppress_nms(i, j)
 
-        for i, j in zip(self.ii_inac.cpu().numpy(), self.jj_inac.cpu().numpy()):
+        for i, j in inactive_edges:
             _suppress_nms(i, j)
 
-        d[(ii - rad < jj) | (d > thresh)] = np.inf
+        d_np[(ii_np - rad < jj_np) | (d_np > thresh)] = np.inf
 
         es = []
         for i in range(t0, t):
@@ -469,15 +510,15 @@ class FactorGraph:
                 es.append((j, i))
                 _suppress(i, j)
 
-        ix = torch.argsort(d)
-        for k in ix:
-            if d[k].item() > thresh:
+        edge_order = np.argsort(d_np)
+        for k in edge_order:
+            if d_np[k] > thresh:
                 continue
 
             if len(es) > self.max_factors:
                 break
 
-            i, j = int(ii[k].item()), int(jj[k].item())
+            i, j = int(ii_np[k]), int(jj_np[k])
             es.append((i, j))
             es.append((j, i))
             _suppress_nms(i, j)
